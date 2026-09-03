@@ -1,0 +1,132 @@
+# Qwen3.8-Flash-Next-NVFP4 · 2× DGX Spark · SGLang TP2 — sparkrun port of
+# https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks (start.sh).
+#
+# What sparkrun replaces from start.sh:  preflight, image pull/distribution,
+# weight download + fan-out, CX7/NCCL detection + per-node pinning, the
+# --dist-init-addr/--nnodes/--node-rank rendezvous, log capture, stop/status.
+# What this recipe carries over verbatim: the serve flags, the GB10 memory
+# rules, and the SM121 QSA kernel patch (applied via pre_exec, see below).
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+model_revision: 7b719225242aacd3dbd3f9407468c2ee9a9d2594   # snapshot benchmarked here
+runtime: sglang
+container: lmsysorg/sglang:qwen38flashnext
+min_nodes: 2
+max_nodes: 2
+
+metadata:
+  description: >-
+    Qwen3.8-Flash-Next (176B/6B-active MoE, NVFP4) on 2× DGX Spark, SGLang TP2
+    over CX7 RoCEv2, NEXTN 3/1/4 speculative decoding, SM121 QSA Triton fallback.
+  maintainer: tadeusz
+  source: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks
+  quantization: nvfp4
+  quant_bits: 4
+  model_dtype: nvfp4
+  model_params: 176B
+  # ~68 GB/rank of weights land on-GPU (experts NVFP4 + dense BF16 + 26 GB fp8
+  # PLE table pinned in host RAM which GB10 unified memory counts anyway).
+  model_vram: 135
+  base_image: lmsysorg/sglang:qwen38flashnext
+  base_image_digest: sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1
+
+defaults:
+  host: 0.0.0.0
+  port: 8000                       # sparkrun convention (start.sh used 8888)
+  served_model_name: Qwen3.8-Flash-Next-NVFP4
+  tensor_parallel: 2
+  # GB10 unified-memory budget. 0.70 (start.sh default) left 33 GB unused on
+  # this cluster; 0.78 grows the KV pool toward the full 262k context. Upstream's
+  # 900k profile ran 0.82 with chunked_prefill 1024 — watch available_gpu_mem.
+  gpu_memory_utilization: 0.78
+  max_model_len: 262144            # native; YaRN 900k = the "-o" profile in the README
+  chunked_prefill: 4096            # keep ≤1024 if you push context past 262k
+  max_num_seqs: 16
+  attention_backend: flashinfer    # required on SM120/SM121 (trtllm_mha is SM100-only)
+  fp4_gemm_backend: flashinfer_cutlass   # proven NVFP4 GEMM on SM121 (SGLang Spark cookbook); explicit > auto
+  ple_offload_embedding: true      # ~26 GB/rank fp8 n-gram table in host RAM (SGLang auto-rule made explicit)
+  mamba_radix_cache_strategy: extra_buffer   # must stay extra_buffer* (page 64 pinned by QSA)
+  mamba_track_interval: 64                   # multiple of page size, ≥ draft tokens
+  # GDN/mamba state pool: NEXTN needs 5 state slots per request. Explicit slot
+  # count (ratio 0.3 gave only 47 slots = 9 requests); 97 slots ≈ 19 requests, ~2.6 GB.
+  max_mamba_cache_size: 97
+  speculative_algorithm: NEXTN     # draft = in-checkpoint MTP layer, nothing extra to download
+  speculative_num_steps: 3
+  speculative_eagle_topk: 1        # PLE spec-decode supports topk=1 only
+  speculative_num_draft_tokens: 4  # must equal steps + 1
+  speculative_attention_mode: decode   # draft attention only in decode (A/B vs default prefill)
+  reasoning_parser: auto
+  tool_call_parser: auto
+  # Pinned decode-graph batch list — SGLang's default list OOMs the graph pool on GB10.
+  cuda_graph_bs: "1 2 3 4 5 6 7 8 10 12 14 16"
+  # Free-form tail, appended last (argparse last-wins). Example YaRN 900k profile:
+  #   -o extra_args='--context-length 900000 --mem-fraction-static 0.82 --chunked-prefill-size 1024 --mamba-full-memory-ratio 0.3 --json-model-override-args {"text_config":{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144},"max_position_embeddings":1048576}}'
+  extra_args: ""
+
+env:
+  # NCCL over the CX7 fabric: sparkrun auto-detects NCCL_NET=IB, NCCL_IB_HCA
+  # (both rails), NCCL_CROSS_NIC, GID index and *_SOCKET_IFNAME per host —
+  # nothing is pinned here so the recipe stays portable. To force the
+  # single-rail config upstream validated: -e NCCL_IB_HCA=rocep1s0f1 -e NCCL_CROSS_NIC=0
+  NCCL_NET_PLUGIN: none
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_DEBUG: WARN
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # start.sh / README rule #4: never use expandable_segments on GB10 for this
+  # model. sparkrun's DGX-Spark platform tier injects it for sglang — blank it.
+  PYTORCH_CUDA_ALLOC_CONF: ""
+
+# memlock/stack ulimits and /dev/infiniband are added by sparkrun's docker
+# executor defaults; only the larger shm is recipe-specific.
+executor_config:
+  shm_size: 32gb
+
+# SM121 kernel work: the stock image dies at warmup (FA4 CuTe MLIR error on
+# SM121). This mod copies the Triton QSA fallback into every container and
+# patches the resolver before serve — same result as start.sh's derivative
+# image, without an image build. Resolved by sparkrun from ./mods/<name>
+# next to this file, or from the registry's mods_subpath once published.
+mods:
+  - sm121-qsa-fallback
+
+command: |
+  python3 -m sglang.launch_server \
+    --model-path {model} \
+    --served-model-name {served_model_name} \
+    --trust-remote-code \
+    --tp-size {tensor_parallel} \
+    --quantization modelopt_fp4 \
+    --attention-backend {attention_backend} \
+    --fp4-gemm-backend {fp4_gemm_backend} \
+    --ple-offload-embedding \
+    --page-size 64 \
+    --mamba-ssm-dtype bfloat16 \
+    --mamba-radix-cache-strategy {mamba_radix_cache_strategy} \
+    --mamba-track-interval {mamba_track_interval} \
+    --max-mamba-cache-size {max_mamba_cache_size} \
+    --mem-fraction-static {gpu_memory_utilization} \
+    --chunked-prefill-size {chunked_prefill} \
+    --max-running-requests {max_num_seqs} \
+    --context-length {max_model_len} \
+    --speculative-algorithm {speculative_algorithm} \
+    --speculative-num-steps {speculative_num_steps} \
+    --speculative-eagle-topk {speculative_eagle_topk} \
+    --speculative-num-draft-tokens {speculative_num_draft_tokens} \
+    --speculative-attention-mode {speculative_attention_mode} \
+    --reasoning-parser {reasoning_parser} \
+    --tool-call-parser {tool_call_parser} \
+    --allow-auto-truncate \
+    --enable-metrics \
+    --enable-cache-report \
+    --disable-prefill-cuda-graph \
+    --cuda-graph-bs-decode {cuda_graph_bs} \
+    --host {host} \
+    --port {port} \
+    {extra_args}
+
+benchmark:
+  tokenizer: Qwen/Qwen3.8-Flash-Next
+  pp: [2048]
+  tg: [128]
+  concurrency: [1, 2, 4]
