@@ -1,0 +1,106 @@
+recipe_version: "2"
+model: turboderp/GLM-5.3-Flash-exl3
+model_revision: 51058cd551c7e570d87bd32a4adee720edce2349   # 2.05bpw branch head; main carries no weights
+runtime: vllm
+min_nodes: 1
+max_nodes: 1
+container: ghcr.io/gitcommit90/glm-5.3-one-spark@sha256:ba6db0547b24162854948fb16cda68dd4408360e03aeba480edb8d3d876eaeef
+
+metadata:
+  description: >-
+    GLM-5.3-Flash EXL3 2.05 bpw on one DGX Spark (TP1), with DFlash2 K7,
+    FP8 KV cache, CUDA graphs, prefix caching, vision, reasoning, and tools.
+    The immutable image contains the complete General23 vLLM integration;
+    model weights are downloaded from their original Hugging Face publishers.
+  maintainer: "gitcommit90"
+  category: chat
+  model_params: 320B
+  model_dtype: exl3
+  kv_dtype: fp8
+  model_vram: 79.96
+  context: 262144
+  license_note: >-
+    The DFlash2 drafter is CC BY-NC-ND 4.0 for noncommercial
+    research/evaluation; users must review and comply with its upstream terms.
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  served_model_name: GLM-5.3-Flash-EXL3-2.05
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 7168
+  gpu_memory_utilization: 0.90
+  kv_cache_dtype: fp8
+  # vLLM needs the pin explicitly: sparkrun downloads by SHA (no refs/ entry
+  # written) and the container is HF_HUB_OFFLINE=1, so bare `main` won't resolve.
+  model_rev: 51058cd551c7e570d87bd32a4adee720edce2349
+  speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_tensor_parallel_size":1,"revision":"bf582e4eacc1810f76656d1811693ff6c6737d2a"}'
+
+# TODO(sparkrun >= 0.3.7): drop this block (fold the drafter pin into
+# speculative_config) and replace {model_rev} with {model_revision}. On 0.3.6
+# prepare() reads only `model`, so an unpinned drafter entry inherits the served
+# model's SHA and dies with "Revision Not Found" after the 80 GB target syncs.
+distribution_config:
+  models:
+    entries:
+      - name: "{model}"
+        revision: 51058cd551c7e570d87bd32a4adee720edce2349
+      - name: incoai/GLM-5.3-Flash-DFlash2
+        revision: bf582e4eacc1810f76656d1811693ff6c6737d2a
+
+executor_config:
+  entrypoint: ""   # image ENTRYPOINT is ["vllm","serve"] and would eat the launcher
+  user: root       # required — see pre_exec
+
+# Patches into the installed vLLM. They need root (dist-packages is root-owned),
+# and root pre_exec creates root-owned dirs in the shared /cache/runtime mount,
+# so serve must be root too — a non-root container dies there with PermissionError.
+# Baking patch_glm_video_placeholders.py into the image would remove both this
+# block and `user: root`; the other six already RUN at build and are kept only to
+# document what this deployment depends on.
+pre_exec:
+  - python3 /opt/glm53/patch_glm_video_placeholders.py       # runtime-only
+  - python3 /opt/glm53/patch_suppress_stops_in_reasoning.py  # redundant
+  - python3 /opt/glm53/patch_scheduler_decode_floor.py       # redundant
+  - python3 /opt/glm53/patch_glm5_drafter_group.py           # redundant
+  - python3 /opt/glm53/patch_hybrid_prefix_hit.py            # redundant
+  - python3 /opt/glm53/patch_xgrammar_termination.py         # redundant
+  - python3 /opt/glm53/patch_kpool_tail_slotmap.py           # redundant
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  CUTE_DSL_ARCH: sm_121a
+  EXL3_FUSED_MOE: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  EXL3_TEMP_ROWS_FUSED: "128"
+  EXL3_FAT_SORTED: "0"
+  EXL3_FAT_BATCHED: "0"
+  EXL3_FAT_KERNEL: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  GLM53_INDEXER_WORKSPACE: stock
+  GLM53_SPINWAIT_MS: stock
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+
+command: |
+  vllm serve {model} \
+    --revision {model_rev} \
+    --served-model-name {served_model_name} \
+    --host {host} --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --tool-call-parser glm47 --enable-auto-tool-choice \
+    --reasoning-parser glm45 \
+    --enable-prefix-caching --no-enable-flashinfer-autotune \
+    --quantization exl3 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --speculative-config '{speculative_config}' \
+    --chat-template /opt/glm53/chat_template.jinja \
+    --limit-mm-per-prompt '{"image":2,"video":0}' --skip-mm-profiling \
+    --cudagraph-capture-sizes 1 2 4 8 16 24 32
