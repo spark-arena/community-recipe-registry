@@ -1,0 +1,12 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+@@ -189,6 +189,9 @@
+     prefix: str,
+ ) -> QuantizeMethodBase | None:
+     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
++    import os
++    if os.environ.get("PLE_FORCE_FP8") == "1":
++        return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+     if not isinstance(quant_config, Fp8Config):
+         return None
+     if not quant_config.is_checkpoint_fp8_serialized:

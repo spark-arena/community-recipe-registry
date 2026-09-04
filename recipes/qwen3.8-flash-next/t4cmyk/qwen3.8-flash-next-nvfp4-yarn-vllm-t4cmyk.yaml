@@ -1,0 +1,70 @@
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+runtime: vllm-distributed
+
+min_nodes: 2
+max_nodes: 2
+
+# NOTE: this is vLLM's own day-0 image, not a Spark Arena image, because the
+# model needs the patched ple_layer.py (see mods/ below). If/when this lands
+# upstream in eugr/spark-vllm-docker, switch to the recommended
+# ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest image instead.
+container: vllm/vllm-openai:qwen38-flash-next
+
+metadata:
+  description: >-
+    Qwen3.8-Flash-Next (RadixArk NVFP4) on 2x DGX Spark -- TP2 + expert
+    parallel, MTP3 speculative decode, FULL_DECODE_ONLY CUDA graphs, 1M
+    context via YaRN RoPE scaling.
+  source: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks
+  model_dtype: nvfp4
+
+mods:
+  - mods/ple-force-fp8-patch
+
+# This image declares ENTRYPOINT ["vllm","serve"] (a "consuming" entrypoint,
+# not the common exec-"$@"-after-setup kind), which parses sparkrun's
+# appended `bash -c <command>` as its own flags instead of running it.
+# Clearing it lets sparkrun's own `vllm serve ...` command in `command:`
+# below run as the actual container command.
+executor_config:
+  entrypoint: ""
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.835
+  max_model_len: 1000000
+  served_model_name: qwen3.8-flash-next
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  reasoning_parser: qwen3
+  tool_call_parser: qwen3_coder
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+  compilation_config: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+  hf-overrides: '{"rope_parameters":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}'
+
+env:
+  PLE_QUANT_OVERRIDE: "fp8"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --distributed-executor-backend mp \
+      -tp {tensor_parallel} \
+      --enable-expert-parallel \
+      --all2all-backend allgather_reducescatter \
+      --load-format safetensors --safetensors-load-strategy lazy \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-chunked-prefill \
+      --speculative-config '{speculative_config}' \
+      --compilation-config '{compilation_config}' \
+      --hf-overrides '{hf-overrides}' \
+      --reasoning-parser {reasoning_parser} \
+      --enable-auto-tool-choice --tool-call-parser {tool_call_parser} \
+      --host {host} --port {port}
