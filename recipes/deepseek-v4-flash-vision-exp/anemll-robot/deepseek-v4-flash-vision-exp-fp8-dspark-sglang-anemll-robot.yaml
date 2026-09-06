@@ -1,0 +1,91 @@
+# DeepSeek-V4-Flash-Vision-Exp · 2× DGX Spark · SGLang TP2 + DSPARK
+#
+# Bring-up notes: https://github.com/Anemll/SGLang-DSv4F-vision-2xSparks
+# Contrasts with Spark Arena vLLM+NVFP4 entry by Shota Zaizen — this recipe is
+# SGLang + official FP8 Vision-Exp on lmsysorg/sglang:dev-v4f-2dgx-v2.
+#
+# REQUIRED: mods/stream-vl-load-weights — stock VL load_weights OOMs on GB10 UMA.
+recipe_version: "2"
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+runtime: sglang
+container: lmsysorg/sglang:dev-v4f-2dgx-v2
+min_nodes: 2
+max_nodes: 2
+
+metadata:
+  description: >-
+    DeepSeek-V4-Flash-Vision-Exp (official FP8) on 2× DGX Spark with SGLang TP=2,
+    DSPARK speculative decoding, b12x MoE, and a streamed VL load_weights overlay
+    required to finish weight load on GB10 UMA. Multimodal image_url supported.
+  maintainer: Anemll / anemll-robot
+  source: https://github.com/Anemll/SGLang-DSv4F-vision-2xSparks
+  cookbook: https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4.md
+  model_params: 284B
+  model_dtype: fp8
+  quantization: fp8
+  # ~74–76 GB/rank target + ~5.5 GB DSpark draft after stream patch
+  model_vram: 160
+  hardware: DGX-Spark-x2-SM121
+  never_use: --weight-loader-disable-mmap
+
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: DeepSeek-V4-Flash-Vision-Exp
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.80
+  max_model_len: 327680
+  chunked_prefill: 8192
+  max_num_seqs: 32
+  cuda_graph_max_bs_decode: 32
+  moe_runner_backend: b12x
+  speculative_algorithm: DSPARK
+  tool_call_parser: deepseekv4
+  reasoning_parser: deepseek-v4
+  extra_args: ""
+
+env:
+  SGLANG_SM120_FLASHMLA_BACKEND: b12x
+  B12X_MLA_SM120_DSV4_H16_NATIVE: "1"
+  SGLANG_OPT_FUSE_MHC_POST_PRE: "1"
+  SGLANG_OPT_FP8_WO_A_GEMM: "1"
+  SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+  SGLANG_B12X_MAX_TOKENS: "8192"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # Leave NCCL IB/HCA/socket to sparkrun auto-detect for portability.
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+executor_config:
+  shm_size: 32gb
+
+mods:
+  - stream-vl-load-weights
+
+command: |
+  sglang serve \
+    --trust-remote-code \
+    --model-path {model} \
+    --served-model-name {served_model_name} \
+    --tp {tensor_parallel} \
+    --moe-runner-backend {moe_runner_backend} \
+    --speculative-algorithm {speculative_algorithm} \
+    --disable-shared-experts-fusion \
+    --weight-loader-drop-cache-after-load \
+    --chunked-prefill-size {chunked_prefill} \
+    --context-length {max_model_len} \
+    --mem-fraction-static {gpu_memory_utilization} \
+    --swa-full-tokens-ratio 0.2 \
+    --cuda-graph-max-bs-decode {cuda_graph_max_bs_decode} \
+    --max-running-requests {max_num_seqs} \
+    --tool-call-parser {tool_call_parser} \
+    --reasoning-parser {reasoning_parser} \
+    --host {host} \
+    --port {port} \
+    {extra_args}
+
+benchmark:
+  tokenizer: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  pp: [2048]
+  tg: [128]
+  concurrency: [1, 2, 4]
