@@ -1,0 +1,90 @@
+# DeepSeek-V4-Flash-Vision-Exp · 2× DGX Spark · vLLM TP2 + DSpark
+#
+# Official FP8 Vision-Exp on vllm/vllm-openai:v0.31.0: 2-node TP=2 with the
+# multiprocessing executor, DSpark speculative decoding, FP8 KV cache,
+# 400k context, up to 8 images per prompt.
+#
+# GB10-tuned: max_num_batched_tokens 4096 (the startup vision-encoder KV
+# profile scales with this budget) and gpu_memory_utilization 0.83
+# (leaves headroom for the CPU heap and page cache that share the
+# 121 GB unified pool).
+recipe_version: "2"
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+runtime: vllm-distributed
+container: vllm/vllm-openai:v0.31.0
+min_nodes: 2
+max_nodes: 2
+
+metadata:
+  description: >-
+    DeepSeek-V4-Flash-Vision-Exp (official FP8) on 2× DGX Spark with
+    vLLM v0.31.0 TP=2 (multiprocessing executor), DSpark speculative
+    decoding, FP8 KV cache, 400k context, up to 8 images per prompt.
+  maintainer: emerald dsouza / emerald-dsouza
+  model_params: 284B
+  model_dtype: fp8
+  quantization: fp8
+  # ~100 GB/node target (0.83 × 121 GB unified) → ~200 GB across 2 nodes
+  model_vram: 200
+  hardware: DGX-Spark-x2-SM121
+
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  distributed_executor_backend: mp
+  gpu_memory_utilization: 0.83
+  max_model_len: 400000
+  max_num_seqs: 8
+  # GB10 unified memory: 4096 fits the startup vision-encoder KV profile
+  # (which scales with this budget).
+  max_num_batched_tokens: 4096
+  kv_cache_dtype: fp8
+  block_size: 256
+  revision: 6821d6ad3681a4b137b066b76094fa82ebd0a380
+  speculative_config: '{"method":"dspark","draft_sample_method":"probabilistic","num_speculative_tokens":6}'
+  reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+  default_chat_template_kwargs: '{"thinking":true,"reasoning_effort":"high"}'
+  limit_mm_per_prompt: '{"image":8}'
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+executor_config:
+  entrypoint: ""   # clears the image ENTRYPOINT ["vllm","serve"], which would swallow the launcher command
+
+command: |
+  vllm serve {model} \
+    --revision {revision} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --block-size {block_size} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --enable-prompt-tokens-details \
+    --async-scheduling \
+    --enable-chunked-prefill \
+    --speculative-config '{speculative_config}' \
+    --tokenizer-mode deepseek_v4 \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{reasoning_config}' \
+    --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune
+
+benchmark:
+  tokenizer: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  pp: [2048]
+  tg: [128]
+  concurrency: [1, 2, 4]
